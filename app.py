@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 import requests
 import re
-import json
+import html
 from urllib.parse import urlparse, unquote, urljoin
 
 app = Flask(__name__, static_folder="static")
@@ -11,9 +11,8 @@ ALLOWED = {
     "goo.gl",
     "www.google.com",
     "google.com",
-    "maps.google.com"
+    "maps.google.com",
 }
-
 
 def valid_coords(lat, lng):
     try:
@@ -25,28 +24,32 @@ def valid_coords(lat, lng):
         pass
     return None
 
-
 def extract(value):
-    s = unquote(str(value))
+    s = html.unescape(unquote(str(value)))
+    s = s.replace("\\u003d", "=").replace("\\u0026", "&")
+    s = s.replace("\\/", "/")
 
     patterns = [
         r'!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)',
-        r'@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)',
+        r'!2d(-?\d+(?:\.\d+)?)!3d(-?\d+(?:\.\d+)?)',
         r'[?&](?:q|query|ll|center)=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)',
-        r'[?&](?:q|query|ll|center)=(-?\d+(?:\.\d+)?)%2[Cc](-?\d+(?:\.\d+)?)',
+        r'@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)',
         r'"latitude"\s*:\s*(-?\d+(?:\.\d+)?).*?"longitude"\s*:\s*(-?\d+(?:\.\d+)?)',
-        r'"lat"\s*:\s*(-?\d+(?:\.\d+)?).*?"lng"\s*:\s*(-?\d+(?:\.\d+)?)'
+        r'"lat"\s*:\s*(-?\d+(?:\.\d+)?).*?"lng"\s*:\s*(-?\d+(?:\.\d+)?)',
     ]
 
-    for pattern in patterns:
+    for i, pattern in enumerate(patterns):
         match = re.search(pattern, s, re.I | re.S)
         if match:
-            coords = valid_coords(*match.groups())
+            a, b = match.groups()
+            if i == 1:
+                coords = valid_coords(b, a)
+            else:
+                coords = valid_coords(a, b)
             if coords:
                 return coords
 
     return None
-
 
 def safe_url(url):
     try:
@@ -61,61 +64,62 @@ def safe_url(url):
     except ValueError:
         return False
 
-
 @app.get("/")
 def index():
     return send_from_directory("static", "index.html")
 
-
 @app.post("/api/resolve")
 def resolve():
     data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
+    value = str(data.get("url", "")).strip()
 
-    if not url:
-        return jsonify(error="กรุณากรอกลิงก์ Google Maps"), 400
+    if not value:
+        return jsonify(error="กรุณากรอกลิงก์หรือพิกัด"), 400
 
-    if len(url) > 2000:
-        return jsonify(error="ลิงก์ยาวเกินไป"), 400
+    if len(value) > 2000:
+        return jsonify(error="ข้อมูลยาวเกินไป"), 400
 
+    # วิธีที่ 1: กรอกตัวเลขพิกัดโดยตรง
     if re.fullmatch(
         r'-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?',
-        url
+        value
     ):
-        coords = valid_coords(*url.split(","))
+        coords = valid_coords(*value.split(","))
         if coords:
             return jsonify(lat=coords[0], lng=coords[1])
+        return jsonify(error="ตัวเลขพิกัดไม่ถูกต้อง"), 400
 
-    if not safe_url(url):
+    # วิธีที่ 2: วางลิงก์ Google Maps
+    if not safe_url(value):
         return jsonify(
             error="รองรับเฉพาะลิงก์ HTTPS ของ Google Maps"
         ), 400
 
-    coords = extract(url)
+    coords = extract(value)
     if coords:
         return jsonify(
             lat=coords[0],
             lng=coords[1],
-            resolved_url=url
+            resolved_url=value
         )
 
     try:
-        current = url
+        current = value
 
         with requests.Session() as session:
             session.headers.update({
                 "User-Agent": (
                     "Mozilla/5.0 (Linux; Android 13) "
-                    "AppleWebKit/537.36 Chrome/120.0 "
-                    "Mobile Safari/537.36"
+                    "AppleWebKit/537.36 "
+                    "Chrome/120.0 Mobile Safari/537.36"
                 ),
                 "Accept-Language": "th-TH,th;q=0.9,en;q=0.8"
             })
 
-            for _ in range(8):
+            for _ in range(10):
                 if not safe_url(current):
                     return jsonify(
-                        error="ลิงก์เปลี่ยนไปยังโดเมนที่ไม่รองรับ"
+                        error="ลิงก์เปลี่ยนไปยังเว็บไซต์ที่ไม่รองรับ"
                     ), 400
 
                 response = session.get(
@@ -133,7 +137,7 @@ def resolve():
 
                         if not safe_url(next_url):
                             return jsonify(
-                                error="ลิงก์เปลี่ยนไปยังโดเมนที่ไม่รองรับ"
+                                error="ลิงก์เปลี่ยนไปยังเว็บไซต์ที่ไม่รองรับ"
                             ), 400
 
                         current = next_url
@@ -145,27 +149,28 @@ def resolve():
                                 lng=coords[1],
                                 resolved_url=current
                             )
-
                         continue
 
                     if response.status_code != 200:
                         break
 
-                    # Read a limited amount of page content.
                     chunks = []
                     total = 0
 
                     for chunk in response.iter_content(16384):
-                        total += len(chunk)
-                        if total > 2_000_000:
+                        if total + len(chunk) > 2_000_000:
+                            chunks.append(
+                                chunk[:2_000_000 - total]
+                            )
                             break
                         chunks.append(chunk)
+                        total += len(chunk)
 
-                    html = b"".join(chunks).decode(
+                    page = b"".join(chunks).decode(
                         "utf-8", errors="replace"
                     )
 
-                    coords = extract(html)
+                    coords = extract(page)
 
                     if coords:
                         return jsonify(
@@ -174,6 +179,23 @@ def resolve():
                             resolved_url=current
                         )
 
+                    # บางหน้าใช้การเปลี่ยนเส้นทางผ่าน HTML
+                    match = re.search(
+                        r'<meta[^>]+http-equiv=["\']refresh["\']'
+                        r'[^>]+content=["\'][^"\']*url=([^"\']+)',
+                        page,
+                        re.I
+                    )
+
+                    if match:
+                        next_url = urljoin(
+                            current,
+                            html.unescape(match.group(1))
+                        )
+                        if safe_url(next_url):
+                            current = next_url
+                            continue
+
                     break
 
                 finally:
@@ -181,8 +203,8 @@ def resolve():
 
         return jsonify(
             error=(
-                "ยังไม่พบพิกัดในลิงก์นี้ "
-                "กรุณาลองใช้ลิงก์เต็มหรือพิกัด"
+                "ยังไม่พบพิกัดจากลิงก์นี้ "
+                "กรุณาลองลิงก์เต็มหรือกรอกตัวเลขพิกัด"
             )
         ), 422
 
@@ -190,7 +212,6 @@ def resolve():
         return jsonify(
             error="เชื่อมต่อ Google Maps ไม่สำเร็จ กรุณาลองใหม่"
         ), 502
-
 
 if __name__ == "__main__":
     app.run(debug=True)
